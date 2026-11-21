@@ -1,0 +1,9 @@
+#!/bin/sh
+if [ "$#" -eq 0 ]; then
+    echo "usage: tpk-uhh <pkg1> [pkg2 ...] (apt-get style: single package, no deps)" >&2
+    exit 1
+fi
+for p in "$@"; do
+    echo ":: tpk-uhh (apt-get mode): fetching ONLY '$p' (no dependencies)..."
+    /usr/local/bin/tpk single-raw "$p" || exit 1
+done

@@ -1,0 +1,280 @@
+#!/bin/sh
+
+REPO_BASE="https://raw.githubusercontent.com/andiroyid2025/toinux-repo/main"
+DEB_MIRROR="https://deb.debian.org/debian"
+DEB_DIST="trixie"
+DEB_ARCH="amd64"
+
+DB_DIR="/var/lib/tpk"
+CACHE_DIR="/var/cache/tpk"
+INDEX_FILE="$DB_DIR/index.txt"
+INSTALLED_FILE="$DB_DIR/installed.txt"
+PKG_LIST_CACHE="$CACHE_DIR/debian_${DEB_DIST}_main_${DEB_ARCH}_Packages"
+
+mkdir -p "$DB_DIR" "$CACHE_DIR"
+touch "$INSTALLED_FILE"
+
+fetch() {
+    url="$1"
+    out="$2"
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -O "$out" "$url"
+        return $?
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$out" "$url"
+        return $?
+    else
+        echo "error: neither wget nor curl found" >&2
+        return 1
+    fi
+}
+
+update_db() {
+    echo ":: Synchronizing toinux-repo database..."
+    tmp_idx="$CACHE_DIR/index.txt.tmp"
+    if fetch "$REPO_BASE/index.txt" "$tmp_idx" && [ -s "$tmp_idx" ]; then
+        mv "$tmp_idx" "$INDEX_FILE"
+        cnt=$(grep -v '^#' "$INDEX_FILE" | grep -v '^[[:space:]]*$' | wc -l)
+        echo ":: toinux-repo synchronized: $cnt packages indexed."
+        return 0
+    fi
+    rm -f "$tmp_idx"
+    echo "warning: toinux-repo index unavailable, Debian fallback will be used" >&2
+    return 1
+}
+
+ensure_deb_index() {
+    [ -s "$PKG_LIST_CACHE" ] && return 0
+    echo ":: Fetching Debian ($DEB_DIST/$DEB_ARCH) package index..."
+    gz_tmp="$CACHE_DIR/Packages.gz"
+    if fetch "$DEB_MIRROR/dists/$DEB_DIST/main/binary-$DEB_ARCH/Packages.gz" "$gz_tmp" && [ -s "$gz_tmp" ]; then
+        gunzip -c "$gz_tmp" > "$PKG_LIST_CACHE" 2>/dev/null || zcat "$gz_tmp" > "$PKG_LIST_CACHE" 2>/dev/null
+        rm -f "$gz_tmp"
+    fi
+    [ -s "$PKG_LIST_CACHE" ]
+}
+
+deb_get_field() {
+    pkg="$1"
+    field="$2"
+    awk -v p="$pkg" -v f="$field" '
+        BEGIN { RS=""; FS="\n" }
+        {
+            match_pkg=0
+            for (i=1; i<=NF; i++) {
+                if ($i == "Package: " p) match_pkg=1
+            }
+            if (match_pkg) {
+                for (i=1; i<=NF; i++) {
+                    if (index($i, f ": ") == 1) {
+                        print substr($i, length(f) + 3)
+                        exit
+                    }
+                }
+            }
+        }
+    ' "$PKG_LIST_CACHE"
+}
+
+extract_deb_to_root() {
+    deb_path="$1"
+    pkg_label="$2"
+    tmp_dir="$CACHE_DIR/deb_unpack_$$"
+    rm -rf "$tmp_dir"
+    mkdir -p "$tmp_dir"
+
+    (cd "$tmp_dir" && ar x "$deb_path" 2>/dev/null) || {
+        echo "error: 'ar' failed on $deb_path" >&2
+        rm -rf "$tmp_dir"
+        return 1
+    }
+
+    data_arc=$(ls "$tmp_dir"/data.tar.* 2>/dev/null | head -n 1)
+    if [ -z "$data_arc" ]; then
+        echo "error: no data.tar.* inside $deb_path" >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    file_list="$DB_DIR/files_${pkg_label}.list"
+    : > "$file_list"
+
+    case "$data_arc" in
+        *.zst)
+            if command -v zstd >/dev/null 2>&1; then
+                zstd -dc "$data_arc" | tar -xvf - -C / 2>&1 | tee "$file_list" | tail -n 12
+            else
+                echo "error: zstd not available for $pkg_label" >&2
+                rm -rf "$tmp_dir"
+                return 1
+            fi
+            ;;
+        *.xz)
+            tar -xJvf "$data_arc" -C / 2>&1 | tee "$file_list" | tail -n 12
+            ;;
+        *.gz)
+            tar -xzvf "$data_arc" -C / 2>&1 | tee "$file_list" | tail -n 12
+            ;;
+        *)
+            tar -xvf "$data_arc" -C / 2>&1 | tee "$file_list" | tail -n 12
+            ;;
+    esac
+
+    rm -rf "$tmp_dir"
+    return 0
+}
+
+install_from_debian() {
+    pkg="$1"
+    ensure_deb_index || { echo "error: could not load Debian package index" >&2; return 1; }
+
+    filename=$(deb_get_field "$pkg" "Filename")
+    ver=$(deb_get_field "$pkg" "Version" | tr ':' '_')
+    [ -n "$ver" ] || ver="deb"
+
+    if [ -z "$filename" ]; then
+        echo "error: package '$pkg' not found in toinux-repo or Debian index" >&2
+        return 1
+    fi
+
+    deb_out="$CACHE_DIR/$(basename "$filename")"
+    echo ":: Retrieving $pkg ($ver) from Debian mirror..."
+    if ! fetch "$DEB_MIRROR/$filename" "$deb_out" || [ ! -s "$deb_out" ]; then
+        rm -f "$deb_out"
+        echo "error: failed downloading $filename" >&2
+        return 1
+    fi
+
+    echo ":: Unpacking $pkg ($ver) to /..."
+    if extract_deb_to_root "$deb_out" "$pkg"; then
+        sed -i "/^${pkg}|/d" "$INSTALLED_FILE" 2>/dev/null || true
+        echo "${pkg}|${ver}|debian:$filename" >> "$INSTALLED_FILE"
+        echo "-> Installed $pkg ($ver) [debian]"
+        return 0
+    fi
+    return 1
+}
+
+install_single_raw() {
+    pkg="$1"
+    [ -s "$INDEX_FILE" ] || update_db || true
+
+    if [ -s "$INDEX_FILE" ]; then
+        line=$(grep -E "^${pkg}\|" "$INDEX_FILE" | head -n 1)
+        if [ -n "$line" ]; then
+            name=$(echo "$line" | cut -d'|' -f1)
+            ver=$(echo "$line" | cut -d'|' -f2)
+            rel_file=$(echo "$line" | cut -d'|' -f3)
+            arc_path="$CACHE_DIR/$(basename "$rel_file")"
+
+            echo ":: Retrieving $name ($ver) from toinux-repo..."
+            if fetch "$REPO_BASE/$rel_file" "$arc_path" && [ -s "$arc_path" ]; then
+                echo ":: Unpacking $name ($ver) to /..."
+                file_list="$DB_DIR/files_${name}.list"
+                if tar -zvxf "$arc_path" -C / 2>&1 | tee "$file_list" | tail -n 12; then
+                    sed -i "/^${name}|/d" "$INSTALLED_FILE" 2>/dev/null || true
+                    echo "${name}|${ver}|${rel_file}" >> "$INSTALLED_FILE"
+                    echo "-> Installed $name ($ver)"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    install_from_debian "$pkg"
+}
+
+install_with_deps() {
+    root_pkg="$1"
+    seen_file="$CACHE_DIR/seen_deps_$$.txt"
+    queue_file="$CACHE_DIR/queue_deps_$$.txt"
+    : > "$seen_file"
+    echo "$root_pkg" > "$queue_file"
+
+    ensure_deb_index || true
+
+    while [ -s "$queue_file" ]; do
+        cur=$(head -n 1 "$queue_file")
+        sed -i '1d' "$queue_file"
+        [ -n "$cur" ] || continue
+        grep -qx "$cur" "$seen_file" 2>/dev/null && continue
+        echo "$cur" >> "$seen_file"
+
+        if [ -s "$PKG_LIST_CACHE" ]; then
+            deps_raw=$(deb_get_field "$cur" "Depends")
+            pre_raw=$(deb_get_field "$cur" "Pre-Depends")
+            combined=$(printf "%s, %s\n" "$pre_raw" "$deps_raw" | tr ',' '\n')
+            echo "$combined" | while IFS= read -r item; do
+                first_alt=$(echo "$item" | cut -d'|' -f1 | awk '{print $1}')
+                case "$first_alt" in
+                    ""|libc6|libgcc-s1|libstdc++6|debconf*) continue ;;
+                esac
+                if ! grep -qx "$first_alt" "$seen_file" 2>/dev/null; then
+                    echo "$first_alt" >> "$queue_file"
+                fi
+            done
+        fi
+
+        install_single_raw "$cur" || return 1
+    done
+
+    rm -f "$seen_file" "$queue_file"
+    return 0
+}
+
+install_pkgs() {
+    [ "$#" -gt 0 ] || { echo "usage: tpk install <pkg1> [pkg2 ...]" >&2; return 1; }
+    update_db || true
+    total=$#
+    idx=0
+    for p in "$@"; do
+        idx=$((idx + 1))
+        echo ""
+        echo "[$idx/$total] Resolving & installing '$p' (apt-style with dependencies)..."
+        install_with_deps "$p" || return 1
+    done
+    echo ""
+    echo ":: Transaction complete."
+}
+
+remove_pkg() {
+    pkg="$1"
+    [ -n "$pkg" ] || { echo "usage: tpk remove <pkg>" >&2; return 1; }
+    file_list="$DB_DIR/files_${pkg}.list"
+    if [ ! -f "$file_list" ]; then
+        echo "error: package not installed: $pkg" >&2
+        return 1
+    fi
+    echo ":: Removing $pkg..."
+    while IFS= read -r entry; do
+        clean=$(echo "$entry" | sed 's/^\.\///; s/ -> .*//')
+        [ -n "$clean" ] || continue
+        target="/$clean"
+        if [ -f "$target" ] || [ -L "$target" ]; then
+            rm -f "$target" 2>/dev/null && echo "   removed $target"
+        fi
+    done < "$file_list"
+    rm -f "$file_list"
+    sed -i "/^${pkg}|/d" "$INSTALLED_FILE" 2>/dev/null || true
+    echo "-> Removed $pkg"
+}
+
+list_pkgs() {
+    if [ ! -s "$INSTALLED_FILE" ]; then
+        echo "No packages installed via tpk."
+        return 0
+    fi
+    cat "$INSTALLED_FILE"
+}
+
+case "${1:-}" in
+    update)     update_db ;;
+    install)    shift; install_pkgs "$@" ;;
+    single-raw) shift; install_single_raw "$1" ;;
+    remove)     shift; remove_pkg "$@" ;;
+    list)       list_pkgs ;;
+    *)
+        echo "usage: tpk <update|install|remove|list> [args...]"
+        exit 1
+        ;;
+esac
