@@ -1,1 +1,3 @@
 # name|version|file|desc
+# name|version|file|desc
+tree|2.2.1-1|pkgs/tree_2.2.1-1.tpk|list contents of directories in a tree-like format
