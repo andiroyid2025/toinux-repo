@@ -1,27 +1,26 @@
 #!/bin/sh
 
 REPO_BASE="https://raw.githubusercontent.com/andiroyid2025/toinux-repo/main"
-DEB_MIRROR="https://deb.debian.org/debian"
-DEB_DIST="trixie"
-DEB_ARCH="amd64"
+APK_MIRROR="http://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64"
 
 DB_DIR="/var/lib/tpk"
 CACHE_DIR="/var/cache/tpk"
 INDEX_FILE="$DB_DIR/index.txt"
 INSTALLED_FILE="$DB_DIR/installed.txt"
-PKG_LIST_CACHE="$CACHE_DIR/debian_${DEB_DIST}_main_${DEB_ARCH}_Packages"
+APK_IDX_DIR="$CACHE_DIR/apk_idx"
+APK_INDEX_FILE="$APK_IDX_DIR/APKINDEX"
 
-mkdir -p "$DB_DIR" "$CACHE_DIR"
+mkdir -p "$DB_DIR" "$CACHE_DIR" "$APK_IDX_DIR"
 touch "$INSTALLED_FILE"
 
 fetch() {
     url="$1"
     out="$2"
     if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$out" "$url"
+        wget -q -T 15 -O "$out" "$url"
         return $?
     elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$out" "$url"
+        curl -fsSL --max-time 15 -o "$out" "$url"
         return $?
     else
         echo "error: neither wget nor curl found" >&2
@@ -39,119 +38,73 @@ update_db() {
         return 0
     fi
     rm -f "$tmp_idx"
-    echo "warning: toinux-repo index unavailable, Debian fallback will be used" >&2
+    echo "warning: toinux-repo index unavailable" >&2
     return 1
 }
 
-ensure_deb_index() {
-    [ -s "$PKG_LIST_CACHE" ] && return 0
-    echo ":: Fetching Debian ($DEB_DIST/$DEB_ARCH) package index..."
-    gz_tmp="$CACHE_DIR/Packages.gz"
-    if fetch "$DEB_MIRROR/dists/$DEB_DIST/main/binary-$DEB_ARCH/Packages.gz" "$gz_tmp" && [ -s "$gz_tmp" ]; then
-        gunzip -c "$gz_tmp" > "$PKG_LIST_CACHE" 2>/dev/null || zcat "$gz_tmp" > "$PKG_LIST_CACHE" 2>/dev/null
-        rm -f "$gz_tmp"
+ensure_apk_index() {
+    [ -s "$APK_INDEX_FILE" ] && return 0
+    echo ":: Fetching Alpine (v3.21/x86_64) package index..."
+    tgz_tmp="$CACHE_DIR/APKINDEX.tar.gz"
+    if fetch "$APK_MIRROR/APKINDEX.tar.gz" "$tgz_tmp" && [ -s "$tgz_tmp" ]; then
+        tar -zxf "$tgz_tmp" -C "$APK_IDX_DIR" 2>/dev/null
+        rm -f "$tgz_tmp"
     fi
-    [ -s "$PKG_LIST_CACHE" ]
+    [ -s "$APK_INDEX_FILE" ]
 }
 
-deb_get_field() {
+apk_field() {
     pkg="$1"
-    field="$2"
-    awk -v p="$pkg" -v f="$field" '
+    key="$2"
+    awk -v p="$pkg" -v k="$key" '
         BEGIN { RS=""; FS="\n" }
         {
-            match_pkg=0
+            found=0
             for (i=1; i<=NF; i++) {
-                if ($i == "Package: " p) match_pkg=1
+                if ($i == "P:" p) found=1
             }
-            if (match_pkg) {
+            if (found) {
                 for (i=1; i<=NF; i++) {
-                    if (index($i, f ": ") == 1) {
-                        print substr($i, length(f) + 3)
+                    if (index($i, k ":") == 1) {
+                        print substr($i, length(k) + 2)
                         exit
                     }
                 }
             }
         }
-    ' "$PKG_LIST_CACHE"
+    ' "$APK_INDEX_FILE"
 }
 
-extract_deb_to_root() {
-    deb_path="$1"
-    pkg_label="$2"
-    tmp_dir="$CACHE_DIR/deb_unpack_$$"
-    rm -rf "$tmp_dir"
-    mkdir -p "$tmp_dir"
+install_from_apk() {
+    pkg="$1"
+    ensure_apk_index || { echo "error: could not load Alpine index" >&2; return 1; }
 
-    (cd "$tmp_dir" && ar x "$deb_path" 2>/dev/null) || {
-        echo "error: 'ar' failed on $deb_path" >&2
-        rm -rf "$tmp_dir"
+    ver=$(apk_field "$pkg" "V")
+    [ -n "$ver" ] || {
+        echo "error: package '$pkg' not found in toinux-repo or Alpine index" >&2
         return 1
     }
 
-    data_arc=$(ls "$tmp_dir"/data.tar.* 2>/dev/null | head -n 1)
-    if [ -z "$data_arc" ]; then
-        echo "error: no data.tar.* inside $deb_path" >&2
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    file_list="$DB_DIR/files_${pkg_label}.list"
-    : > "$file_list"
-
-    case "$data_arc" in
-        *.zst)
-            if command -v zstd >/dev/null 2>&1; then
-                zstd -dc "$data_arc" | tar -xvf - -C / 2>&1 | tee "$file_list" | tail -n 12
-            else
-                echo "error: zstd not available for $pkg_label" >&2
-                rm -rf "$tmp_dir"
-                return 1
-            fi
-            ;;
-        *.xz)
-            tar -xJvf "$data_arc" -C / 2>&1 | tee "$file_list" | tail -n 12
-            ;;
-        *.gz)
-            tar -xzvf "$data_arc" -C / 2>&1 | tee "$file_list" | tail -n 12
-            ;;
-        *)
-            tar -xvf "$data_arc" -C / 2>&1 | tee "$file_list" | tail -n 12
-            ;;
-    esac
-
-    rm -rf "$tmp_dir"
-    return 0
-}
-
-install_from_debian() {
-    pkg="$1"
-    ensure_deb_index || { echo "error: could not load Debian package index" >&2; return 1; }
-
-    filename=$(deb_get_field "$pkg" "Filename")
-    ver=$(deb_get_field "$pkg" "Version" | tr ':' '_')
-    [ -n "$ver" ] || ver="deb"
-
-    if [ -z "$filename" ]; then
-        echo "error: package '$pkg' not found in toinux-repo or Debian index" >&2
-        return 1
-    fi
-
-    deb_out="$CACHE_DIR/$(basename "$filename")"
-    echo ":: Retrieving $pkg ($ver) from Debian mirror..."
-    if ! fetch "$DEB_MIRROR/$filename" "$deb_out" || [ ! -s "$deb_out" ]; then
-        rm -f "$deb_out"
-        echo "error: failed downloading $filename" >&2
+    apk_name="${pkg}-${ver}.apk"
+    apk_path="$CACHE_DIR/$apk_name"
+    echo ":: Retrieving $pkg ($ver) from Alpine mirror..."
+    if ! fetch "$APK_MIRROR/$apk_name" "$apk_path" || [ ! -s "$apk_path" ]; then
+        rm -f "$apk_path"
+        echo "error: failed downloading $apk_name" >&2
         return 1
     fi
 
     echo ":: Unpacking $pkg ($ver) to /..."
-    if extract_deb_to_root "$deb_out" "$pkg"; then
+    file_list="$DB_DIR/files_${pkg}.list"
+    : > "$file_list"
+    if tar -zxvf "$apk_path" -C / --exclude='.PKGINFO' --exclude='.SIGN*' 2>&1 | tee "$file_list" | tail -n 10; then
         sed -i "/^${pkg}|/d" "$INSTALLED_FILE" 2>/dev/null || true
-        echo "${pkg}|${ver}|debian:$filename" >> "$INSTALLED_FILE"
-        echo "-> Installed $pkg ($ver) [debian]"
+        echo "${pkg}|${ver}|apk:$apk_name" >> "$INSTALLED_FILE"
+        echo "-> Installed $pkg ($ver)"
         return 0
     fi
+
+    echo "error: failed unpacking $apk_name" >&2
     return 1
 }
 
@@ -171,7 +124,7 @@ install_single_raw() {
             if fetch "$REPO_BASE/$rel_file" "$arc_path" && [ -s "$arc_path" ]; then
                 echo ":: Unpacking $name ($ver) to /..."
                 file_list="$DB_DIR/files_${name}.list"
-                if tar -zvxf "$arc_path" -C / 2>&1 | tee "$file_list" | tail -n 12; then
+                if tar -zvxf "$arc_path" -C / 2>&1 | tee "$file_list" | tail -n 10; then
                     sed -i "/^${name}|/d" "$INSTALLED_FILE" 2>/dev/null || true
                     echo "${name}|${ver}|${rel_file}" >> "$INSTALLED_FILE"
                     echo "-> Installed $name ($ver)"
@@ -181,7 +134,7 @@ install_single_raw() {
         fi
     fi
 
-    install_from_debian "$pkg"
+    install_from_apk "$pkg"
 }
 
 install_with_deps() {
@@ -191,7 +144,7 @@ install_with_deps() {
     : > "$seen_file"
     echo "$root_pkg" > "$queue_file"
 
-    ensure_deb_index || true
+    ensure_apk_index || true
 
     while [ -s "$queue_file" ]; do
         cur=$(head -n 1 "$queue_file")
@@ -200,17 +153,15 @@ install_with_deps() {
         grep -qx "$cur" "$seen_file" 2>/dev/null && continue
         echo "$cur" >> "$seen_file"
 
-        if [ -s "$PKG_LIST_CACHE" ]; then
-            deps_raw=$(deb_get_field "$cur" "Depends")
-            pre_raw=$(deb_get_field "$cur" "Pre-Depends")
-            combined=$(printf "%s, %s\n" "$pre_raw" "$deps_raw" | tr ',' '\n')
-            echo "$combined" | while IFS= read -r item; do
-                first_alt=$(echo "$item" | cut -d'|' -f1 | awk '{print $1}')
-                case "$first_alt" in
-                    ""|libc6|libgcc-s1|libstdc++6|debconf*) continue ;;
+        if [ -s "$APK_INDEX_FILE" ]; then
+            deps_line=$(apk_field "$cur" "D")
+            for tok in $deps_line; do
+                dep_name=$(printf "%s" "$tok" | sed 's/[<>=~].*//')
+                case "$dep_name" in
+                    ""|so:*|cmd:*|pc:*|!*|musl|busybox) continue ;;
                 esac
-                if ! grep -qx "$first_alt" "$seen_file" 2>/dev/null; then
-                    echo "$first_alt" >> "$queue_file"
+                if ! grep -qx "$dep_name" "$seen_file" 2>/dev/null; then
+                    echo "$dep_name" >> "$queue_file"
                 fi
             done
         fi
@@ -230,7 +181,7 @@ install_pkgs() {
     for p in "$@"; do
         idx=$((idx + 1))
         echo ""
-        echo "[$idx/$total] Resolving & installing '$p' (apt-style with dependencies)..."
+        echo "[$idx/$total] Resolving & installing '$p' (with dependencies)..."
         install_with_deps "$p" || return 1
     done
     echo ""
